@@ -2,10 +2,10 @@
 # Startup script for the Flux Server
 
 # Set default environment variables if not already set
-export FLUX_MODEL_PATH=${FLUX_MODEL_PATH:-"./models/FLUX.1-dev"}
-export FLUX_DEVICE=${FLUX_DEVICE:-"cuda"}
+export FLUX_MODEL_PATH=${FLUX_MODEL_PATH:-"path/to/FLUX.1-dev"}
+export FLUX_DEVICE=${FLUX_DEVICE:-"mps"}
 export FLUX_USE_BFLOAT16=${FLUX_USE_BFLOAT16:-"true"}
-export FLUX_ENABLE_MODEL_CPU_OFFLOAD=${FLUX_ENABLE_MODEL_CPU_OFFLOAD:-"true"}
+export FLUX_ENABLE_MODEL_CPU_OFFLOAD=${FLUX_ENABLE_MODEL_CPU_OFFLOAD:-"false"}
 export FLUX_SERVER_HOST=${FLUX_SERVER_HOST:-"0.0.0.0"}
 export FLUX_SERVER_PORT=${FLUX_SERVER_PORT:-"8000"}
 export FLUX_SERVER_WORKERS=${FLUX_SERVER_WORKERS:-"1"}

@@ -1,328 +1,342 @@
 """
-Flux Pipeline Connector for Open-WebUI
+Open-WebUI Pipeline for Flux Integration
 
-This module provides a pipeline connector for Open-WebUI to generate images
-using a local FLUX.1-dev model through the simplified Flux server.
+This module implements a custom Pipeline for Open-WebUI that connects to flux-server
+for distributed image generation on Linux machines with NVIDIA GPUs.
 """
 
 import os
-import time
 import json
 import base64
-import aiohttp
 import asyncio
-import re
-from typing import Dict, Any, List, Optional, Tuple
+import aiohttp
+from typing import Dict, Any, Optional, List, Union, Generator, Iterator
+from pydantic import BaseModel
 
-
-class FluxConfig:
-    """Configuration for the Flux pipeline connector."""
+class Pipeline:
+    """
+    A Pipeline implementation for Open-WebUI that connects to flux-server
+    for image generation on Linux machines with NVIDIA GPUs.
+    """
     
+    class Valves(BaseModel):
+        """Configuration parameters for the pipeline."""
+        flux_server_url: str = os.getenv("FLUX_SERVER_URL", "http://localhost:4030")
+        default_width: int = int(os.getenv("FLUX_DEFAULT_WIDTH", "1024"))
+        default_height: int = int(os.getenv("FLUX_DEFAULT_HEIGHT", "1024"))
+        default_steps: int = int(os.getenv("FLUX_DEFAULT_STEPS", "20"))
+        #default_format: str = os.getenv("FLUX_DEFAULT_FORMAT", "PNG")
+        #default_quality: int = int(os.getenv("FLUX_DEFAULT_QUALITY", "85"))
+        #default_model: str = os.getenv("FLUX_DEFAULT_MODEL", "flux.1-schnell")
+        default_guidance: float = float(os.getenv("FLUX_DEFAULT_GUIDANCE", "3.5"))
+        polling_interval: float = float(os.getenv("FLUX_POLLING_INTERVAL", "1.0"))
+        max_retries: int = int(os.getenv("FLUX_MAX_RETRIES", "3"))
+        timeout_seconds: int = int(os.getenv("FLUX_TIMEOUT_SECONDS", "300"))
+        #use_tensorrt: bool = os.getenv("FLUX_USE_TENSORRT", "true").lower() == "true"
+
     def __init__(self):
-        # Server connection settings
-        self.server_url = os.environ.get("FLUX_SERVER_URL", "http://localhost:8000")
+        """Initialize the pipeline with default configuration."""
+        self.valves = self.Valves()
+        self.name = "Flux Pipeline"
         
-        # Default generation parameters
-        self.default_params = {
-            "width": int(os.environ.get("FLUX_DEFAULT_WIDTH", "1024")),
-            "height": int(os.environ.get("FLUX_DEFAULT_HEIGHT", "1024")),
-            "num_inference_steps": int(os.environ.get("FLUX_DEFAULT_STEPS", "50")),
-            "guidance_scale": float(os.environ.get("FLUX_DEFAULT_GUIDANCE", "3.5")),
-        }
-        
-        # Connection parameters
-        self.polling_interval = float(os.environ.get("FLUX_POLLING_INTERVAL", "1.0"))
-        self.max_retries = int(os.environ.get("FLUX_MAX_RETRIES", "60"))
-        self.timeout_seconds = int(os.environ.get("FLUX_TIMEOUT_SECONDS", "30"))
-
-
-class FluxPipelineConnector:
-    """
-    Pipeline connector for Open-WebUI to generate images using a local FLUX.1-dev model.
-    """
+    def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Union[str, Generator, Iterator]:
     
-    def __init__(self, config=None):
-        """
-        Initialize the connector with the given configuration.
-        
-        Args:
-            config: Configuration object (optional)
-        """
-        self.config = config or FluxConfig()
+        return asyncio.run(self.process_chat_completion(body))
         
     async def process_chat_completion(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Process a chat completion request from Open-WebUI.
         
         Args:
-            request_data: Request data from Open-WebUI
+            request_data: The request data from Open-WebUI
             
         Returns:
-            Response data for Open-WebUI
+            A response dictionary compatible with Open-WebUI
         """
+        print(f"pipe:{__name__}")
         try:
-            # Extract messages from request
-            messages = request_data.get("messages", [])
+            # Extract prompt from request
+            prompt = self._extract_prompt(request_data)
             
-            # Extract prompt and parameters
-            prompt, params = self._extract_parameters(messages)
+            # Extract additional parameters if provided
+            params = self._extract_parameters(request_data)
             
-            # Check if we have a valid prompt
-            if not prompt.strip():
-                return self._format_error_response("Please provide a prompt for image generation.")
+            print(prompt)
+            # Submit generation request to flux-server
+            print(params)
+            task_id = await self._submit_generation(prompt, **params)
             
-            # Submit generation request
-            task_id = await self._submit_generation(prompt, params)
+            # Poll for completion
+            image_data = await self._poll_until_complete(task_id)
             
-            # Poll until complete
-            success = await self._poll_until_complete(task_id)
-            
-            if not success:
-                return self._format_error_response("Image generation failed or timed out.")
-            
-            # Retrieve image
-            image_data = await self._retrieve_image(task_id)
-            
-            if not image_data:
-                return self._format_error_response("Failed to retrieve generated image.")
-            
-            # Format response
+            # Format response for Open-WebUI
             return self._format_response(image_data, prompt)
+            
         except Exception as e:
-            # Catch any unexpected errors
-            return self._format_error_response(f"An error occurred: {str(e)}")
+            # Handle errors and return an appropriate response
+            return self._format_error_response(str(e))
     
-    def _extract_parameters(self, messages: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    def _extract_prompt(self, request_data: Dict[str, Any]) -> str:
         """
-        Extract prompt and parameters from messages.
+        Extract the prompt from the request data.
         
         Args:
-            messages: List of message dictionaries
+            request_data: The request data from Open-WebUI
             
         Returns:
-            Tuple of (prompt, parameters)
+            The extracted prompt
         """
-        # Get the last user message
-        user_messages = [m for m in messages if m.get("role") == "user"]
-        if not user_messages:
-            return "", {}
+        # Extract from messages if available
+        if "messages" in request_data and request_data["messages"]:
+            for message in reversed(request_data["messages"]):
+                if message.get("role") == "user" and message.get("content"):
+                    return message["content"]
         
-        last_user_message = user_messages[-1]["content"]
+        # Fall back to prompt if available
+        if "prompt" in request_data:
+            return request_data["prompt"]
         
-        # Check if the message contains parameters
+        raise ValueError("No prompt found in request data")
+    
+    def _extract_parameters(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract additional parameters from the request data.
+        
+        Args:
+            request_data: The request data from Open-WebUI
+            
+        Returns:
+            A dictionary of parameters
+        """
         params = {}
         
-        # Extract parameters using regex
-        param_pattern = r"with parameters?:?\s*\n([\s\S]+?)(?:\n\n|$)"
-        param_match = re.search(param_pattern, last_user_message, re.IGNORECASE)
-        
-        if param_match:
-            param_text = param_match.group(1)
-            # Extract individual parameters
-            for line in param_text.split("\n"):
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    key = key.strip().lower()
-                    value = value.strip()
-                    
-                    # Convert values to appropriate types
-                    if key in ["width", "height", "steps", "num_inference_steps", "seed"]:
-                        try:
-                            params[key] = int(value)
-                        except ValueError:
-                            pass
-                    elif key in ["guidance", "guidance_scale"]:
-                        try:
-                            params[key] = float(value)
-                        except ValueError:
-                            pass
-                    else:
-                        params[key] = value
+        # Check for parameters in the request data
+        if "parameters" in request_data:
+            params_data = request_data["parameters"]
             
-            # Remove parameter section from prompt
-            prompt = last_user_message.replace(param_match.group(0), "").strip()
-        else:
-            prompt = last_user_message
-        
-        # Map parameters to API expected format
-        if "steps" in params:
-            params["num_inference_steps"] = params.pop("steps")
-        if "guidance" in params:
-            params["guidance_scale"] = params.pop("guidance")
+            # Extract width if provided
+            if "width" in params_data:
+                params["width"] = int(params_data["width"])
             
-        # Merge with default parameters
-        merged_params = {**self.config.default_params, **params}
-        
-        return prompt, merged_params
-    
-    async def _submit_generation(self, prompt: str, params: Dict[str, Any]) -> str:
-        """
-        Submit a generation request to the Flux server.
-        
-        Args:
-            prompt: Text prompt for image generation
-            params: Generation parameters
+            # Extract height if provided
+            if "height" in params_data:
+                params["height"] = int(params_data["height"])
             
-        Returns:
-            Task ID from the server
-        """
-        async with aiohttp.ClientSession() as session:
-            try:
-                # Prepare request data
-                request_data = {
-                    "prompt": prompt,
-                    **params
-                }
+            # Extract steps if provided
+            if "steps" in params_data:
+                params["steps"] = int(params_data["steps"])
+            
+            # Extract seed if provided
+            if "seed" in params_data:
+                params["seed"] = int(params_data["seed"])
+            
+            # Extract format if provided
+            if "format" in params_data:
+                params["format"] = params_data["format"]
+            
+            # Extract quality if provided
+            if "quality" in params_data:
+                params["quality"] = int(params_data["quality"])
                 
-                # Send request to server
-                async with session.post(
-                    f"{self.config.server_url}/api/generate",
-                    json=request_data,
-                    timeout=self.config.timeout_seconds
-                ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise Exception(f"Error submitting generation request: {error_text}")
-                    
-                    response_data = await response.json()
-                    return response_data["task_id"]
-            except Exception as e:
-                raise Exception(f"Failed to submit generation request: {str(e)}")
+            # Extract model if provided
+            if "model" in params_data:
+                params["model"] = params_data["model"]
+                
+            # Extract guidance if provided
+            if "guidance" in params_data:
+                params["guidance"] = float(params_data["guidance"])
+                
+            # Extract TensorRT settings if provided
+            if "use_tensorrt" in params_data:
+                params["use_tensorrt"] = bool(params_data["use_tensorrt"])
+        
+        return params
     
-    async def _poll_until_complete(self, task_id: str) -> bool:
+    async def _submit_generation(self, prompt: str, **kwargs) -> str:
         """
-        Poll the server until the task is complete.
+        Submit an image generation request to flux-server.
         
         Args:
-            task_id: Task ID to poll for
+            prompt: The prompt for image generation
+            **kwargs: Additional parameters
             
         Returns:
-            True if successful, False otherwise
+            The task ID for the generation request
         """
-        retries = 0
-        while retries < self.config.max_retries:
+        data = {
+            "prompt": prompt,
+            "width": kwargs.get("width", self.valves.default_width),
+            "height": kwargs.get("height", self.valves.default_height),
+            "num_inference_steps": kwargs.get("steps", self.valves.default_steps),
+            #"format": kwargs.get("format", self.valves.default_format),
+            #"quality": kwargs.get("quality", self.valves.default_quality),
+            #"model": kwargs.get("model", self.valves.default_model),
+            "guidance_scale": kwargs.get("guidance", self.valves.default_guidance),
+            #"use_tensorrt": kwargs.get("use_tensorrt", self.valves.use_tensorrt)
+        }
+        
+        # Add seed if provided
+        if "seed" in kwargs:
+            data["seed"] = kwargs["seed"]
+        
+        print(f"Submission params: {data}")
+        
+        # Try to submit the request with retries
+        for attempt in range(self.valves.max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.valves.flux_server_url}/api/generate", 
+                        json=data,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        print(f"Response: {response.json}")
+                        if response.status == 200:
+                            result = await response.json()
+                            return result["task_id"]
+                        else:
+                            error = await response.text()
+                            raise Exception(f"Failed to submit generation: {error}")
+            except Exception as e:
+                if attempt == self.valves.max_retries - 1:
+                    raise
+                await asyncio.sleep(1)
+        
+        raise Exception("Failed to submit generation after multiple attempts")
+
+    async def _poll_until_complete(self, task_id: str) -> bytes:
+        """
+        Poll flux-server until the image generation is complete.
+        
+        Args:
+            task_id: The task ID to poll
+            
+        Returns:
+            The generated image data
+        """
+        start_time = asyncio.get_event_loop().time()
+        
+        while True:
+            # Check for timeout
+            current_time = asyncio.get_event_loop().time()
+            if current_time - start_time > self.valves.timeout_seconds:
+                raise TimeoutError(f"Image generation timed out after {self.valves.timeout_seconds} seconds")
+            
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
-                        f"{self.config.server_url}/api/status/{task_id}",
-                        timeout=self.config.timeout_seconds
+                        f"{self.valves.flux_server_url}/api/status/{task_id}",
+                        timeout=aiohttp.ClientTimeout(total=10)
                     ) as response:
-                        if response.status != 200:
-                            retries += 1
-                            await asyncio.sleep(self.config.polling_interval)
-                            continue
-                        
-                        status_data = await response.json()
-                        status = status_data.get("status")
-                        
-                        if status == "done":
-                            return True
-                        elif status == "error":
-                            return False
-                        
-                        # Still processing, wait and try again
-                        await asyncio.sleep(self.config.polling_interval)
-            except Exception:
-                retries += 1
-                await asyncio.sleep(self.config.polling_interval)
-        
-        return False
-    
-    async def _retrieve_image(self, task_id: str) -> Optional[str]:
+                        if response.status == 200:
+                            status_data = await response.json()
+                            if status_data["status"] == "done":
+                                return await self._retrieve_image(task_id)
+                            elif status_data["status"] == "error":
+                                error_msg = status_data.get("error", "Unknown error")
+                                raise Exception(f"Image generation failed: {error_msg}")
+                            else:
+                                # Wait before polling again
+                                wait_time = status_data.get("wait_remaining", self.valves.polling_interval)
+                                await asyncio.sleep(min(max(wait_time, 0.5), 10))
+                        else:
+                            error = await response.text()
+                            raise Exception(f"Failed to check status: {error}")
+            except aiohttp.ClientError:
+                # On connection error, wait a bit and retry
+                await asyncio.sleep(2)
+
+    async def _retrieve_image(self, task_id: str) -> bytes:
         """
-        Retrieve the generated image from the server.
+        Retrieve the generated image from flux-server.
         
         Args:
-            task_id: Task ID to retrieve image for
+            task_id: The task ID to retrieve
             
         Returns:
-            Base64-encoded image data or None if failed
+            The image data
         """
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.config.server_url}/api/image/{task_id}?base64_format=true",
-                    timeout=self.config.timeout_seconds
-                ) as response:
-                    if response.status != 200:
-                        return None
-                    
-                    # Response is the base64-encoded image
-                    return await response.text()
-        except Exception:
-            return None
+        for attempt in range(self.valves.max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{self.valves.flux_server_url}/api/image/{task_id}?base64_format=true",
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            # The response is a base64-encoded image
+                            image_data = await response.text()
+                            return base64.b64decode(image_data)
+                        else:
+                            error = await response.text()
+                            raise Exception(f"Failed to retrieve image: {error}")
+            except Exception as e:
+                if attempt == self.valves.max_retries - 1:
+                    raise
+                await asyncio.sleep(1)
+        
+        raise Exception("Failed to retrieve image after multiple attempts")
     
-    def _format_response(self, image_data: str, prompt: str) -> Dict[str, Any]:
+    def _format_response(self, image_data: bytes, prompt: str) -> Dict[str, Any]:
         """
         Format the response for Open-WebUI.
         
         Args:
-            image_data: Base64-encoded image data
-            prompt: Original prompt
+            image_data: The generated image data
+            prompt: The original prompt
             
         Returns:
-            Formatted response for Open-WebUI
+            A response dictionary compatible with Open-WebUI
         """
-        # Format as markdown with embedded image
-        content = f"Generated image for: \"{prompt}\"\n\n![Generated Image](data:image/jpeg;base64,{image_data})"
+        # Encode the image as base64
+        image_base64 = base64.b64encode(image_data).decode("utf-8")
         
-        return {
-            "id": f"flux-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "flux-generate",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content
-                    },
-                    "finish_reason": "stop"
-                }
-            ]
-        }
+        # Determine the image format
+        #image_format = self.valves.default_format.lower()
+        image_format = "jpeg"
+        
+        # Create a response with the image
+        # return {
+        #     "id": f"flux-{int(asyncio.get_event_loop().time())}",
+        #     "object": "chat.completion",
+        #     "created": int(asyncio.get_event_loop().time()),
+        #     "model": "flux-generate",
+        #     "choices": [
+        #         {
+        #             "index": 0,
+        #             "message": {
+        #                 "role": "assistant",
+        #                 "content": f"![Image](data:image/{image_format};base64,{image_base64})",
+        #             },
+        #             "finish_reason": "stop"
+        #         }
+        #     ]
+        # }
+        return f"![Image](data:image/{image_format};base64,{image_base64})"
     
     def _format_error_response(self, error_message: str) -> Dict[str, Any]:
         """
         Format an error response for Open-WebUI.
         
         Args:
-            error_message: Error message
+            error_message: The error message
             
         Returns:
-            Formatted error response
+            A response dictionary compatible with Open-WebUI
         """
         return {
-            "id": f"flux-error-{int(time.time())}",
+            "id": "flux-generate-error",
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": int(asyncio.get_event_loop().time()),
             "model": "flux-generate",
             "choices": [
                 {
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": f"Error: {error_message}"
+                        "content": f"Error generating image: {error_message}",
                     },
                     "finish_reason": "stop"
                 }
             ]
         }
-
-
-# Main entry point for Open-WebUI
-async def process_chat_completion(request_data):
-    """
-    Process a chat completion request from Open-WebUI.
-    
-    This is the main entry point that Open-WebUI will call.
-    
-    Args:
-        request_data: Request data from Open-WebUI
-        
-    Returns:
-        Response data for Open-WebUI
-    """
-    connector = FluxPipelineConnector()
-    return await connector.process_chat_completion(request_data)
