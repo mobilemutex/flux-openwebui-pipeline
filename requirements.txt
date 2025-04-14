@@ -1,0 +1,22 @@
+# requirements.txt for simplified-flux-integration
+
+# Core dependencies
+torch>=2.0.0
+diffusers>=0.33.1
+transformers>=4.30.0
+accelerate>=0.20.0
+pillow>=9.0.0
+
+# Server dependencies
+fastapi>=0.95.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# Pipeline connector dependencies
+aiohttp>=3.8.4
+asyncio>=3.4.3
+
+# Testing dependencies
+pytest>=7.3.1
+requests>=2.28.0
